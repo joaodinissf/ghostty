@@ -1,0 +1,6 @@
+.zig-cache
+zig-out
+.git
+.claude
+macos/build
+node_modules

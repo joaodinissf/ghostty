@@ -108,6 +108,26 @@ pub fn SplitTree(comptime V: type) type {
             pub const Direction = enum { left, right, down, up };
         };
 
+        /// Junction info for a split node: which of its children (if any)
+        /// are themselves splits with the perpendicular layout. The two
+        /// perpendicular inner dividers terminate against the outer
+        /// divider, forming either a T (3 panes meet) or — if both
+        /// children are perpendicular splits AND their inner ratios
+        /// align — a + (4 panes meet at one point).
+        ///
+        /// At least one of `left` / `right` is non-null whenever this
+        /// struct is returned. With both populated and the inner ratios
+        /// approximately equal it is geometrically a +-junction; with
+        /// both populated but ratios differing it is two independent
+        /// T-junctions stacked along the outer divider.
+        pub const Junction = struct {
+            outer: Node.Handle,
+            /// Inner perpendicular split on the left/top child, if any.
+            left: ?Node.Handle,
+            /// Inner perpendicular split on the right/bottom child, if any.
+            right: ?Node.Handle,
+        };
+
         /// Initialize a new tree with a single view.
         pub fn init(gpa: Allocator, view: *View) Allocator.Error!Self {
             var arena = ArenaAllocator.init(gpa);
@@ -881,6 +901,46 @@ pub fn SplitTree(comptime V: type) type {
                 parent_handle,
                 @min(@max(new_ratio, 0), 1),
             );
+            return result;
+        }
+
+        /// If `outer` is a split node whose child on either side is itself
+        /// a split of the perpendicular layout, return the junction info.
+        /// Returns null if `outer` is a leaf, both children are leaves, or
+        /// neither child is a perpendicular split.
+        ///
+        /// Both `left` and `right` may be populated, in which case the
+        /// caller distinguishes a single +-junction (inner ratios align
+        /// within some epsilon) from two stacked T-junctions (ratios
+        /// differ). This helper does not impose an epsilon — that's a
+        /// presentation concern.
+        pub fn junctionAt(self: *const Self, outer: Node.Handle) ?Junction {
+            if (@intFromEnum(outer) >= self.nodes.len) return null;
+            const s = switch (self.nodes[outer.idx()]) {
+                .split => |sp| sp,
+                .leaf => return null,
+            };
+
+            var result: Junction = .{ .outer = outer, .left = null, .right = null };
+
+            if (s.left.idx() < self.nodes.len) {
+                switch (self.nodes[s.left.idx()]) {
+                    .split => |cs| if (cs.layout != s.layout) {
+                        result.left = s.left;
+                    },
+                    .leaf => {},
+                }
+            }
+            if (s.right.idx() < self.nodes.len) {
+                switch (self.nodes[s.right.idx()]) {
+                    .split => |cs| if (cs.layout != s.layout) {
+                        result.right = s.right;
+                    },
+                    .leaf => {},
+                }
+            }
+
+            if (result.left == null and result.right == null) return null;
             return result;
         }
 
@@ -2319,6 +2379,188 @@ test "SplitTree: resize nested split" {
             \\+---+
             \\
         );
+    }
+}
+
+test "SplitTree: junctionAt returns null for empty / leaf" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var empty: TestTree = .empty;
+    defer empty.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), empty.junctionAt(.root));
+
+    var v: TestView = .{ .label = "A" };
+    var single: TestTree = try .init(alloc, &v);
+    defer single.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), single.junctionAt(.root));
+}
+
+test "SplitTree: junctionAt returns null for no perpendicular child" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B — both children are leaves.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), s1.junctionAt(.root));
+
+    // A | (B | C) — right child is a same-layout split.
+    var v3: TestView = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const right_b: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, right_b, .right, 0.5, &t3);
+    defer s2.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), s2.junctionAt(.root));
+}
+
+test "SplitTree: junctionAt detects perpendicular right child" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B then split B downward => A | (B / C). Outer .horizontal,
+    // right child becomes .vertical.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+
+    var v3: TestView = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const b_handle: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, b_handle, .down, 0.5, &t3);
+    defer s2.deinit();
+
+    const j = s2.junctionAt(.root) orelse return error.JunctionNotFound;
+    try testing.expectEqual(TestTree.Node.Handle.root, j.outer);
+    try testing.expectEqual(@as(?TestTree.Node.Handle, null), j.left);
+    const inner = j.right orelse return error.RightMissing;
+    switch (s2.nodes[inner.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerNotASplit,
+    }
+}
+
+test "SplitTree: junctionAt detects perpendicular left child" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B then split A downward => (A / D) | B.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+
+    var v3: TestView = .{ .label = "D" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const a_handle: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "A")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, a_handle, .down, 0.5, &t3);
+    defer s2.deinit();
+
+    const j = s2.junctionAt(.root) orelse return error.JunctionNotFound;
+    try testing.expectEqual(TestTree.Node.Handle.root, j.outer);
+    try testing.expectEqual(@as(?TestTree.Node.Handle, null), j.right);
+    const inner = j.left orelse return error.LeftMissing;
+    switch (s2.nodes[inner.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerNotASplit,
+    }
+}
+
+test "SplitTree: junctionAt detects both children perpendicular (potential +)" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B then split A downward and split B downward =>
+    // (A / D) | (B / E). Outer .horizontal, both children .vertical.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+
+    var v3: TestView = .{ .label = "D" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const a_handle: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "A")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, a_handle, .down, 0.5, &t3);
+    defer s2.deinit();
+
+    var v4: TestView = .{ .label = "E" };
+    var t4: TestTree = try .init(alloc, &v4);
+    defer t4.deinit();
+    const b_handle: TestTree.Node.Handle = at: {
+        var it = s2.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s3: TestTree = try s2.split(alloc, b_handle, .down, 0.5, &t4);
+    defer s3.deinit();
+
+    const j = s3.junctionAt(.root) orelse return error.JunctionNotFound;
+    try testing.expectEqual(TestTree.Node.Handle.root, j.outer);
+    const inner_left = j.left orelse return error.LeftMissing;
+    const inner_right = j.right orelse return error.RightMissing;
+    switch (s3.nodes[inner_left.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerLeftNotASplit,
+    }
+    switch (s3.nodes[inner_right.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerRightNotASplit,
     }
 }
 

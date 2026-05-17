@@ -51,6 +51,32 @@ private struct TerminalSplitSubtreeView: View {
     var isRoot: Bool = false
     let action: (TerminalSplitOperation) -> Void
 
+    /// Build a `SplitJunctionConfig` describing whichever of this split's
+    /// children are themselves splits of the perpendicular orientation.
+    /// Returns `nil` if neither child qualifies (the common case).
+    static func junctionConfig(
+        for split: SplitTree<Ghostty.SurfaceView>.Node.Split,
+        action: @escaping (TerminalSplitOperation) -> Void
+    ) -> SplitJunctionConfig? {
+        func inner(
+            for child: SplitTree<Ghostty.SurfaceView>.Node
+        ) -> SplitJunctionConfig.Inner? {
+            guard case .split(let inner) = child, inner.direction != split.direction else {
+                return nil
+            }
+            return .init(
+                ratio: CGFloat(inner.ratio),
+                onRatioChanged: { newRatio in
+                    action(.resize(.init(node: child, ratio: Double(newRatio))))
+                }
+            )
+        }
+        let l = inner(for: split.left)
+        let r = inner(for: split.right)
+        guard l != nil || r != nil else { return nil }
+        return .init(left: l, right: r)
+    }
+
     var body: some View {
         switch node {
         case .leaf(let leafView):
@@ -61,6 +87,7 @@ private struct TerminalSplitSubtreeView: View {
             case .horizontal: .horizontal
             case .vertical: .vertical
             }
+            let junction = Self.junctionConfig(for: split, action: action)
 
             SplitView(
                 splitViewDirection,
@@ -71,6 +98,7 @@ private struct TerminalSplitSubtreeView: View {
                 }),
                 dividerColor: ghostty.config.splitDividerColor,
                 resizeIncrements: .init(width: 1, height: 1),
+                junction: junction,
                 left: {
                     TerminalSplitSubtreeView(node: split.left, action: action)
                 },
