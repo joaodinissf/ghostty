@@ -45,6 +45,11 @@ class BaseTerminalController: NSWindowController,
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
+    /// Publishes the divider/junction-handle hit-regions (in window
+    /// coordinates) out of the SwiftUI split layout so that the AppKit surface
+    /// event monitor can let seam clicks pass the focus-transfer gate.
+    let splitSeamRegistry = SplitSeamRegistry()
+
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
 

@@ -24,8 +24,16 @@ struct SplitView<L: View, R: View>: View {
     /// Called when the divider is double-tapped to equalize splits.
     let onEqualize: () -> Void
 
+    /// Stable identity for this split's divider seam, used to publish its
+    /// hit-region to the ``SplitSeamRegistry``. Nil disables registration.
+    let seamID: AnyHashable?
+
     /// The minimum size (in points) of a split
     let minSize: CGFloat = 10
+
+    /// Registry that the divider publishes its window-space hit-region into so
+    /// the AppKit event monitor can let seam clicks through the focus gate.
+    @Environment(\.splitSeamRegistry) private var seamRegistry
 
     /// The current fractional width of the split view. 0.5 means L/R are equally sized, for example.
     @Binding var split: CGFloat
@@ -65,7 +73,56 @@ struct SplitView<L: View, R: View>: View {
             }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(splitViewLabel)
+            // Publish the divider hit-region (in window/global coordinates) so
+            // the AppKit surface event monitor can let seam clicks through the
+            // focus-transfer gate. Re-runs whenever layout or origin changes.
+            .onChange(of: dividerRegistration(in: geo)) { registration in
+                updateSeamRegistration(registration)
+            }
+            .onAppear {
+                updateSeamRegistration(dividerRegistration(in: geo))
+            }
+            .onDisappear {
+                if let seamID { seamRegistry?.unregister(id: seamID) }
+            }
         }
+    }
+
+    /// The divider's hit-region as `(id, globalRect)`, or nil when there's no
+    /// `seamID` or no registry to publish into. Computed in SwiftUI global
+    /// coordinates (top-left origin) by offsetting the local splitter geometry
+    /// by the view's global origin.
+    private func dividerRegistration(in geo: GeometryProxy) -> SeamRegistration? {
+        guard let seamID else { return nil }
+        let globalOrigin = geo.frame(in: .global).origin
+        let splitterPoint = self.splitterPoint(for: geo.size, leftRect: leftRect(for: geo.size))
+        let hitThickness = splitterVisibleSize + splitterInvisibleSize
+        let localRect: CGRect = switch direction {
+        case .horizontal:
+            CGRect(x: splitterPoint.x - hitThickness / 2, y: 0,
+                   width: hitThickness, height: geo.size.height)
+        case .vertical:
+            CGRect(x: 0, y: splitterPoint.y - hitThickness / 2,
+                   width: geo.size.width, height: hitThickness)
+        }
+        let globalRect = localRect.offsetBy(dx: globalOrigin.x, dy: globalOrigin.y)
+        return SeamRegistration(id: seamID, rect: globalRect)
+    }
+
+    private func updateSeamRegistration(_ registration: SeamRegistration?) {
+        guard let seamRegistry else { return }
+        guard let registration else {
+            if let seamID { seamRegistry.unregister(id: seamID) }
+            return
+        }
+        seamRegistry.register(id: registration.id, kind: .divider, rect: registration.rect)
+    }
+
+    /// A computed divider registration, made `Equatable` so `onChange` only
+    /// fires when the published region actually moves.
+    private struct SeamRegistration: Equatable {
+        let id: AnyHashable
+        let rect: CGRect
     }
 
     /// Initialize a split view that can be resized by manually dragging the divider.
@@ -74,6 +131,7 @@ struct SplitView<L: View, R: View>: View {
         _ split: Binding<CGFloat>,
         dividerColor: Color,
         resizeIncrements: NSSize = .init(width: 1, height: 1),
+        seamID: AnyHashable? = nil,
         @ViewBuilder left: (() -> L),
         @ViewBuilder right: (() -> R),
         onEqualize: @escaping () -> Void
@@ -82,6 +140,7 @@ struct SplitView<L: View, R: View>: View {
         self._split = split
         self.dividerColor = dividerColor
         self.resizeIncrements = resizeIncrements
+        self.seamID = seamID
         self.left = left()
         self.right = right()
         self.onEqualize = onEqualize
