@@ -96,6 +96,7 @@ enum BackportPointerStyle {
     case resizeDown
     case resizeUpDown
     case resizeLeftRight
+    case crosshair
 
     #if canImport(AppKit)
     @available(macOS 15, *)
@@ -113,6 +114,7 @@ enum BackportPointerStyle {
         case .resizeDown: return .frameResize(position: .top, directions: [.inward])
         case .resizeUpDown: return .frameResize(position: .top)
         case .resizeLeftRight: return .frameResize(position: .trailing)
+        case .crosshair: return .image(Image(nsImage: NSCursor.crosshair.image), hotSpot: .center)
         }
     }
     #endif

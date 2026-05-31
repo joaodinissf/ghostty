@@ -899,6 +899,8 @@ class BaseTerminalController: NSWindowController,
         switch action {
         case .resize(let resize):
             splitDidResize(node: resize.node, to: resize.ratio)
+        case .junctionResize(let resize):
+            junctionDidResize(resize)
         case .drop(let drop):
             splitDidDrop(source: drop.payload, destination: drop.destination, zone: drop.zone)
         }
@@ -910,6 +912,22 @@ class BaseTerminalController: NSWindowController,
             surfaceTree = try surfaceTree.replacing(node: node, with: resizedNode)
         } catch {
             Ghostty.logger.warning("failed to replace node during split resize: \(error)")
+        }
+    }
+
+    private func junctionDidResize(_ resize: TerminalSplitOperation.JunctionResize) {
+        // Apply the outer ratio and the inner ratios in one combined edit so
+        // the inner dividers are addressed positionally rather than re-resolved
+        // structurally (which could move the wrong divider in symmetric
+        // layouts). We only resolve the captured outer node once.
+        let resizedNode = resize.node.resizingJunction(
+            outerRatio: resize.outerRatio,
+            leftInnerRatio: resize.leftInnerRatio,
+            rightInnerRatio: resize.rightInnerRatio)
+        do {
+            surfaceTree = try surfaceTree.replacing(node: resize.node, with: resizedNode)
+        } catch {
+            Ghostty.logger.warning("failed to replace node during junction resize: \(error)")
         }
     }
 

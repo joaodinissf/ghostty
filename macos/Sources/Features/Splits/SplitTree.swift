@@ -653,6 +653,38 @@ extension SplitTree.Node {
         }
     }
 
+    /// Apply a coordinated "junction drag" to this split node, returning a new
+    /// node with the outer ratio and the perpendicular inner divider(s) moved
+    /// together.
+    ///
+    /// This performs a *single* combined edit so the inner dividers are
+    /// addressed by their structural position (left/right child) rather than
+    /// re-resolved by a structural `path(to:)` lookup. That matters in
+    /// symmetric `+`/aligned-`T` layouts, where two distinct inner splits can
+    /// compare structurally equal and a lookup could resolve the wrong one.
+    ///
+    /// - Parameters:
+    ///   - outerRatio: New ratio for this (outer) split.
+    ///   - leftInnerRatio: New ratio for the left/top child, applied only if
+    ///     that child is itself a split. Nil leaves it untouched.
+    ///   - rightInnerRatio: New ratio for the right/bottom child, applied only
+    ///     if that child is itself a split. Nil leaves it untouched.
+    func resizingJunction(
+        outerRatio: Double,
+        leftInnerRatio: Double?,
+        rightInnerRatio: Double?
+    ) -> Self {
+        guard case .split(let split) = self else { return self }
+        let newLeft = leftInnerRatio.map { split.left.resizing(to: $0) } ?? split.left
+        let newRight = rightInnerRatio.map { split.right.resizing(to: $0) } ?? split.right
+        return .split(.init(
+            direction: split.direction,
+            ratio: outerRatio,
+            left: newLeft,
+            right: newRight
+        ))
+    }
+
     /// Get the leftmost leaf in this subtree
     func leftmostLeaf() -> ViewType {
         switch self {
