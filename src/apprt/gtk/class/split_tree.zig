@@ -285,6 +285,72 @@ pub const SplitTree = extern struct {
         self.setTree(&new_tree);
     }
 
+    /// Pop the given surface out of this split tree and into a brand-new
+    /// window. The surface is removed from this tree (its sibling is promoted
+    /// in its place via the core `detach` helper) and re-homed as the sole
+    /// pane of a fresh window.
+    ///
+    /// No-op (returns false) if `surface` isn't found in this tree or if this
+    /// tree is a single pane (nothing to pop out of). Returns true if the pane
+    /// was popped out.
+    ///
+    /// NOTE(gtk-untested): this is net-new behavior with no prototype
+    /// reference. The flow is:
+    ///   1. find the leaf handle of `surface` in our current tree;
+    ///   2. guard against single-pane trees (root is a leaf);
+    ///   3. call core `detach(handle)` -> { remaining, detached };
+    ///   4. set `remaining` as our tree (sibling promoted, surface gone);
+    ///   5. ask the Application to open a new window adopting `detached`.
+    /// Ownership: `detach` hands us two independently-owned trees. We pass
+    /// `&remaining`/`&detached` to `setTree`/`newWindowWithTree`, which CLONE
+    /// (boxedCopy) them, so we still own and must `deinit` both locally.
+    pub fn popoutSurface(self: *Self, surface: *Surface) bool {
+        const tree = self.getTree() orelse return false;
+
+        // A single-pane tree has nothing to pop out of: the root is a leaf.
+        switch (tree.nodes[@as(Surface.Tree.Node.Handle, .root).idx()]) {
+            .leaf => return false,
+            .split => {},
+        }
+
+        // Find the handle of the surface within our tree.
+        const handle: Surface.Tree.Node.Handle = handle: {
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                if (entry.view == surface) break :handle entry.handle;
+            }
+            // Surface isn't in this tree (shouldn't happen for a child).
+            return false;
+        };
+
+        const alloc = Application.default().allocator();
+
+        // Detach: produces a `remaining` tree (with the leaf removed and its
+        // sibling promoted) and a fresh single-leaf `detached` tree.
+        var detached = tree.detach(alloc, handle) catch |err| {
+            log.warn("failed to detach surface for pop-out err={}", .{err});
+            return false;
+        };
+        defer detached.remaining.deinit();
+        defer detached.detached.deinit();
+
+        log.debug(
+            "popping out surface handle={} remaining={f} detached={f}",
+            .{ handle, &detached.remaining, &detached.detached },
+        );
+
+        // Open a new window adopting the detached subtree FIRST. If this
+        // fails we leave our own tree untouched so the surface isn't lost.
+        Application.default().newWindowWithTree(&detached.detached) catch |err| {
+            log.warn("failed to open new window for pop-out err={}", .{err});
+            return false;
+        };
+
+        // Now drop the surface from our tree (sibling promoted).
+        self.setTree(&detached.remaining);
+        return true;
+    }
+
     pub fn resize(
         self: *Self,
         direction: Surface.Tree.Split.Direction,

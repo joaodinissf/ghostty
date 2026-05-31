@@ -2279,6 +2279,55 @@ const Action = struct {
         );
     }
 
+    /// Open a brand-new window that ADOPTS an existing surface tree, rather
+    /// than spawning a fresh surface. Used by the split pop-out flow: a pane
+    /// detached from another window is re-homed as the first (and only) tab
+    /// of this new window.
+    ///
+    /// `tree` is cloned downstream (by `SplitTree.setTree`); the caller keeps
+    /// ownership of its copy.
+    ///
+    /// NOTE(gtk-untested): net-new. Mirrors `newWindow`'s window setup but
+    /// routes the detached tree in via `Window.newTabWithTree` instead of
+    /// `newTabForWindow` (which would spawn an empty surface).
+    pub fn newWindowWithTree(
+        self: *Application,
+        tree: *const Surface.Tree,
+    ) !void {
+        // See `newWindow` for why this is set.
+        self.private().requested_window = true;
+
+        const win = Window.new(self, .{});
+
+        // Keep the window config in sync with the application config, exactly
+        // as `initAndShowWindow` does.
+        _ = gobject.Object.bindProperty(
+            self.as(gobject.Object),
+            "config",
+            win.as(gobject.Object),
+            "config",
+            .{},
+        );
+
+        // Adopt the detached tree as this window's first tab.
+        _ = win.newTabWithTree(tree);
+
+        // Estimate the initial window size before presenting so the window
+        // manager can position it correctly.
+        if (win.getActiveSurface()) |surface| {
+            surface.estimateInitialSize();
+            if (surface.getDefaultSize()) |size| {
+                win.as(gtk.Window).setDefaultSize(
+                    @intCast(size.width),
+                    @intCast(size.height),
+                );
+            }
+        }
+
+        // Show the window
+        gtk.Window.present(win.as(gtk.Window));
+    }
+
     fn initAndShowWindow(
         self: *Application,
         win: *Window,

@@ -226,6 +226,38 @@ pub const Tab = extern struct {
         return tab;
     }
 
+    /// Create a new tab that ADOPTS an existing surface tree instead of
+    /// spawning a fresh surface. Used by the pop-out flow where a pane is
+    /// detached from another tab/window and re-homed here.
+    ///
+    /// `tree` is cloned by `SplitTree.setTree`; the caller retains ownership
+    /// of its copy.
+    ///
+    /// NOTE(gtk-untested): net-new, mirrors `new` but skips the initial
+    /// `newSplit` and instead sets the provided tree on the split widget.
+    pub fn newWithTree(config: ?*Config, tree: *const Surface.Tree) *Self {
+        const tab = gobject.ext.newInstance(Tab, .{});
+
+        const priv: *Private = tab.private();
+
+        if (config) |c| priv.config = c.ref();
+
+        // If our configuration is null then we get the configuration
+        // from the application.
+        if (priv.config == null) {
+            const app = Application.default();
+            priv.config = app.getConfig();
+        }
+
+        tab.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
+
+        // Adopt the provided tree (cloned by setTree) instead of spawning a
+        // fresh surface.
+        priv.split_tree.setTree(tree);
+
+        return tab;
+    }
+
     fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
 
