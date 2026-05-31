@@ -1,5 +1,22 @@
 import SwiftUI
 
+/// Geometry helpers for split dragging, factored out (and non-generic) so they
+/// can be unit-tested independently of SwiftUI's gesture machinery.
+enum SplitGeometry {
+    /// Map a 1-D gesture coordinate to a divider ratio in `(0, 1)`, clamping so
+    /// neither side collapses below `minSize` points. Gesture coordinates that
+    /// fall outside `[0, extent]` (e.g. dragging past the window edge) are
+    /// clamped too, so a pane can never be driven to a zero/sub-`minSize` size
+    /// — which previously let a terminal pane shrink below a single text row.
+    static func clampedRatio(_ location: CGFloat, extent: CGFloat, minSize: CGFloat) -> CGFloat {
+        // A degenerate or too-small extent can't honor minSize on both sides;
+        // fall back to the midpoint.
+        guard extent > minSize * 2 else { return 0.5 }
+        let clamped = min(max(minSize, location), extent - minSize)
+        return clamped / extent
+    }
+}
+
 /// Configures the optional junction-drag overlay on a `SplitView`. A junction
 /// appears when at least one of the split's children is itself a split of the
 /// perpendicular orientation, so an inner divider terminates against the outer
@@ -52,8 +69,10 @@ struct SplitView<L: View, R: View>: View {
     /// the outer divider.
     let junction: SplitJunctionConfig?
 
-    /// The minimum size (in points) of a split
-    let minSize: CGFloat = 10
+    /// The minimum size (in points) of a split. Kept comfortably above a
+    /// single text row for typical fonts so a pane can't be dragged down to a
+    /// sub-row size (which is unusable and previously stressed terminal reflow).
+    let minSize: CGFloat = 24
 
     /// Registry that the divider publishes its window-space hit-region into so
     /// the AppKit event monitor can let seam clicks through the focus gate.
@@ -270,12 +289,12 @@ struct SplitView<L: View, R: View>: View {
             .onChanged { gesture in
                 switch direction {
                 case .horizontal:
-                    let new = min(max(minSize, gesture.location.x), size.width - minSize)
-                    split = new / size.width
+                    split = SplitGeometry.clampedRatio(
+                        gesture.location.x, extent: size.width, minSize: minSize)
 
                 case .vertical:
-                    let new = min(max(minSize, gesture.location.y), size.height - minSize)
-                    split = new / size.height
+                    split = SplitGeometry.clampedRatio(
+                        gesture.location.y, extent: size.height, minSize: minSize)
                 }
             }
     }
@@ -399,14 +418,17 @@ private struct JunctionHandleView: View {
                         }
                         let lockstep = lockstepLatched ?? false
 
-                        let x = min(max(minSize, gesture.location.x), size.width - minSize)
-                        let y = min(max(minSize, gesture.location.y), size.height - minSize)
-
                         // Along the outer split's axis the gesture moves the
                         // outer divider; perpendicular to it, the inner divider.
+                        // Both are clamped so neither pane collapses below a
+                        // usable size, even when dragging past the window edge.
+                        let xRatio = SplitGeometry.clampedRatio(
+                            gesture.location.x, extent: size.width, minSize: minSize)
+                        let yRatio = SplitGeometry.clampedRatio(
+                            gesture.location.y, extent: size.height, minSize: minSize)
                         let (outerRatio, inner): (CGFloat, CGFloat) = switch direction {
-                        case .horizontal: (x / size.width, y / size.height)
-                        case .vertical:   (y / size.height, x / size.width)
+                        case .horizontal: (xRatio, yRatio)
+                        case .vertical:   (yRatio, xRatio)
                         }
 
                         let leftInner: CGFloat?
