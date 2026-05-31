@@ -764,6 +764,54 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
+        /// The result of `detach`: the remaining tree with the leaf removed
+        /// (its sibling taking its place, per `remove` semantics) plus a new
+        /// single-leaf tree holding the detached view. Both trees are
+        /// independently owned by the caller and must each be `deinit`ed.
+        pub const Detached = struct {
+            /// The original tree with the detached leaf removed. Empty if the
+            /// detached leaf was the whole tree (the only leaf).
+            remaining: Self,
+            /// A new tree containing just the detached view.
+            detached: Self,
+        };
+
+        /// "Pop a pane out": given a leaf `at`, return both the tree with that
+        /// leaf removed (its sibling taking its place) and a fresh single-leaf
+        /// tree containing the detached view.
+        ///
+        /// `at` must reference a leaf node. Detaching the only leaf (the root
+        /// of a single-view tree) yields an empty `remaining` tree and a
+        /// single-leaf `detached` tree, effectively re-homing the same view.
+        ///
+        /// Ownership: views are reference counted. The detached view gains one
+        /// ref for the new single-leaf `detached` tree (via `init`); the
+        /// surviving views are ref'd for `remaining` (via `remove`). `self` is
+        /// left untouched and the caller still owns its refs, so it must be
+        /// `deinit`ed independently as usual. On error nothing is leaked.
+        pub fn detach(
+            self: *Self,
+            gpa: Allocator,
+            at: Node.Handle,
+        ) Allocator.Error!Detached {
+            assert(at.idx() < self.nodes.len);
+            const view = switch (self.nodes[at.idx()]) {
+                .leaf => |v| v,
+                .split => unreachable, // `at` must be a leaf
+            };
+
+            // A fresh single-leaf tree for the detached view. `init` takes the
+            // extra ref this new tree needs.
+            var detached = try Self.init(gpa, view);
+            errdefer detached.deinit();
+
+            // The remaining tree with the leaf removed. `remove` handles the
+            // sibling-promotion and refs the surviving views itself.
+            const remaining = try self.remove(gpa, at);
+
+            return .{ .remaining = remaining, .detached = detached };
+        }
+
         /// Reference all the nodes in the given slice, handling unref if
         /// any fail. This should be called LAST so you don't have to undo
         /// the refs at any further point after this.
@@ -2775,4 +2823,102 @@ test "SplitTree: junctionAt detects both children perpendicular (potential +)" {
         ),
         .leaf => return error.InnerRightNotASplit,
     }
+}
+
+fn findLeaf(t: *const TestTree, label: []const u8) ?TestTree.Node.Handle {
+    var it = t.iterator();
+    return while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, label)) break entry.handle;
+    } else null;
+}
+
+fn labelAt(t: *const TestTree, h: TestTree.Node.Handle) []const u8 {
+    return switch (t.nodes[h.idx()]) {
+        .leaf => |v| v.label,
+        .split => "<split>",
+    };
+}
+
+test "SplitTree: detach from 2-pane split promotes sibling" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B
+    var vA: TestView = .{ .label = "A" };
+    var tA: TestTree = try .init(alloc, &vA);
+    defer tA.deinit();
+    var vB: TestView = .{ .label = "B" };
+    var tB: TestTree = try .init(alloc, &vB);
+    defer tB.deinit();
+    var tree: TestTree = try tA.split(alloc, .root, .right, 0.5, &tB);
+    defer tree.deinit();
+
+    const b_handle = findLeaf(&tree, "B") orelse return error.NotFound;
+
+    var d = try tree.detach(alloc, b_handle);
+    defer d.remaining.deinit();
+    defer d.detached.deinit();
+
+    // Detached tree is a single leaf "B".
+    try testing.expect(!d.detached.isSplit());
+    try testing.expectEqualStrings("B", labelAt(&d.detached, .root));
+
+    // Remaining tree is just the sibling "A" at the root.
+    try testing.expect(!d.remaining.isSplit());
+    try testing.expectEqualStrings("A", labelAt(&d.remaining, .root));
+}
+
+test "SplitTree: detach from nested tree keeps the rest intact" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | (B / C): detaching C should leave A | B.
+    var vA: TestView = .{ .label = "A" };
+    var tA: TestTree = try .init(alloc, &vA);
+    defer tA.deinit();
+    var vB: TestView = .{ .label = "B" };
+    var tB: TestTree = try .init(alloc, &vB);
+    defer tB.deinit();
+    var s1: TestTree = try tA.split(alloc, .root, .right, 0.5, &tB);
+    defer s1.deinit();
+    var vC: TestView = .{ .label = "C" };
+    var tC: TestTree = try .init(alloc, &vC);
+    defer tC.deinit();
+    const b_handle = findLeaf(&s1, "B") orelse return error.NotFound;
+    var tree: TestTree = try s1.split(alloc, b_handle, .down, 0.5, &tC);
+    defer tree.deinit();
+
+    const c_handle = findLeaf(&tree, "C") orelse return error.NotFound;
+
+    var d = try tree.detach(alloc, c_handle);
+    defer d.remaining.deinit();
+    defer d.detached.deinit();
+
+    // Detached single-leaf "C".
+    try testing.expect(!d.detached.isSplit());
+    try testing.expectEqualStrings("C", labelAt(&d.detached, .root));
+
+    // Remaining is A | B: still a split, with both A and B present and C gone.
+    try testing.expect(d.remaining.isSplit());
+    try testing.expect(findLeaf(&d.remaining, "A") != null);
+    try testing.expect(findLeaf(&d.remaining, "B") != null);
+    try testing.expect(findLeaf(&d.remaining, "C") == null);
+}
+
+test "SplitTree: detach the only leaf yields empty remaining" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var vA: TestView = .{ .label = "A" };
+    var tree: TestTree = try .init(alloc, &vA);
+    defer tree.deinit();
+
+    var d = try tree.detach(alloc, .root);
+    defer d.remaining.deinit();
+    defer d.detached.deinit();
+
+    // The only leaf re-homes into the detached tree; remaining is empty.
+    try testing.expect(d.remaining.isEmpty());
+    try testing.expect(!d.detached.isEmpty());
+    try testing.expectEqualStrings("A", labelAt(&d.detached, .root));
 }
