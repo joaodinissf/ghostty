@@ -1034,6 +1034,14 @@ fn resizeCols(
         remaining_rows: usize,
         wrapped_rows: usize,
     } = if (cursor) |c| cursor: {
+        // When shrinking columns, `resize` shrinks rows *before* calling us,
+        // so `self.rows` may already be smaller than the cursor row `c.y`,
+        // which was captured in the old (taller) layout. If the cursor now
+        // falls outside the shrunk active area the preservation heuristic
+        // doesn't apply: skip it. Otherwise the cursor pin resolves above the
+        // active area (tripping the `.left_up` row iterator's order assert)
+        // and `self.rows - c.y - 1` below underflows. `self.rows` is >= 1.
+        if (c.y >= self.rows) break :cursor null;
         const p = if (c.pin) |cursor_pin| cursor_pin.* else self.pin(.{ .active = .{
             .x = c.x,
             .y = c.y,
@@ -12784,6 +12792,49 @@ test "PageList resize reflow less cols cursor goes to scrollback" {
 
     // Our cursor should move to the first row
     try testing.expect(s.pointFromPin(.active, p.*) == null);
+}
+
+test "PageList resize reflow less cols with rows shrunk to 1 and cursor below new area" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // Regression: dragging a `+` split junction past the window edge collapses
+    // a pane to a single row while also reducing its column count. `resize`
+    // shrinks rows before reflowing columns, so `resizeCols` saw a cursor row
+    // (`c.y`) from the old, taller layout that exceeded the new 1-row active
+    // area, underflowing `self.rows - c.y - 1` (an integer-overflow panic; in
+    // Debug a stale cursor pin also tripped the `.left_up` row-iterator order
+    // assert). The cursor row must be clamped to the current range.
+    var s = try init(alloc, 10, 10, null);
+    defer s.deinit();
+    const page = &s.pages.first.?.data;
+    for (0..s.rows) |y| {
+        for (0..s.cols) |x| {
+            const rac = page.getRowAndCell(x, y);
+            rac.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = @intCast(x) },
+            };
+        }
+    }
+
+    // Track a cursor pin at the old bottom row, mirroring how `Screen.resize`
+    // passes `self.cursor.page_pin`. With the pin set the preservation block
+    // can't be short-circuited by a null pin resolution.
+    const cursor_pin = try s.trackPin(s.pin(.{ .active = .{ .x = 0, .y = 9 } }).?);
+    defer s.untrackPin(cursor_pin);
+
+    // Shrink to one row and fewer columns, with the cursor hint still pointing
+    // at the old bottom row (y = 9, well outside the new 1-row active area).
+    // Must not panic (integer overflow / order assert).
+    try s.resize(.{
+        .cols = 4,
+        .rows = 1,
+        .reflow = true,
+        .cursor = .{ .x = 0, .y = 9, .pin = cursor_pin },
+    });
+    try testing.expectEqual(@as(usize, 4), s.cols);
+    try testing.expectEqual(@as(usize, 1), s.rows);
 }
 
 test "PageList resize reflow less cols cursor in unchanged row" {
