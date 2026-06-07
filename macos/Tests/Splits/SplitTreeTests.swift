@@ -425,6 +425,49 @@ struct SplitTreeTests {
         #expect(resized == root)
     }
 
+    @Test func resizingJunctionUpdatesOuterAndInner() {
+        // Outer horizontal split whose left child is a perpendicular (vertical)
+        // split: a T-junction. Resize the outer and the left inner together.
+        typealias Node = SplitTree<MockView>.Node
+        let inner: Node = .split(.init(
+            direction: .vertical, ratio: 0.5,
+            left: .leaf(view: MockView()), right: .leaf(view: MockView())))
+        let outer: Node = .split(.init(
+            direction: .horizontal, ratio: 0.5,
+            left: inner, right: .leaf(view: MockView())))
+
+        let resized = outer.resizingJunction(
+            outerRatio: 0.6, leftInnerRatio: 0.3, rightInnerRatio: nil)
+
+        guard case .split(let outerSplit) = resized,
+              case .split(let innerSplit) = outerSplit.left else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(abs(outerSplit.ratio - 0.6) < 0.001)
+        #expect(abs(innerSplit.ratio - 0.3) < 0.001)
+    }
+
+    @Test func resizingJunctionIgnoresNonSplitChild() {
+        // A right child that's a leaf should be left untouched even if a ratio
+        // is (defensively) supplied for it.
+        typealias Node = SplitTree<MockView>.Node
+        let rightLeaf: Node = .leaf(view: MockView())
+        let outer: Node = .split(.init(
+            direction: .horizontal, ratio: 0.5,
+            left: .leaf(view: MockView()), right: rightLeaf))
+
+        let resized = outer.resizingJunction(
+            outerRatio: 0.4, leftInnerRatio: nil, rightInnerRatio: 0.2)
+
+        guard case .split(let outerSplit) = resized else {
+            Issue.record("unexpected node type")
+            return
+        }
+        #expect(abs(outerSplit.ratio - 0.4) < 0.001)
+        #expect(outerSplit.right == rightLeaf)
+    }
+
     // MARK: - Spatial
 
     @Test(arguments: [

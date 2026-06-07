@@ -429,7 +429,6 @@ pub const Window = extern struct {
         },
     ) *adw.TabPage {
         const priv: *Private = self.private();
-        const tab_view = priv.tab_view;
 
         // Create our new tab object
         const tab = Tab.new(
@@ -448,6 +447,28 @@ pub const Window = extern struct {
             }
             tab.setParentWithContext(p, context);
         }
+
+        return self.insertTabPage(tab);
+    }
+
+    /// Create a new tab page that ADOPTS an existing surface tree (e.g. a
+    /// pane popped out of another window). Returns the inserted page.
+    ///
+    /// NOTE(gtk-untested): net-new. Mirrors `newTabPage`'s insertion logic
+    /// but builds the tab via `Tab.newWithTree` so it shows the detached
+    /// subtree instead of a freshly-spawned surface.
+    pub fn newTabWithTree(self: *Self, tree: *const Surface.Tree) *adw.TabPage {
+        const priv: *Private = self.private();
+        const tab = Tab.newWithTree(priv.config, tree);
+        return self.insertTabPage(tab);
+    }
+
+    /// Shared tail of the tab-creation paths: insert `tab` into the tab view,
+    /// select it, wire up the property/signal bindings, and run the initial
+    /// surface-tree notification. Returns the inserted page.
+    fn insertTabPage(self: *Self, tab: *Tab) *adw.TabPage {
+        const priv: *Private = self.private();
+        const tab_view = priv.tab_view;
 
         // Get the position that we should insert the new tab at.
         const config = if (priv.config) |v| v.get() else {

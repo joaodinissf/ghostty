@@ -108,6 +108,41 @@ pub fn SplitTree(comptime V: type) type {
             pub const Direction = enum { left, right, down, up };
         };
 
+        /// Junction info for a split node: which of its children (if any)
+        /// are themselves splits with the perpendicular layout. The two
+        /// perpendicular inner dividers terminate against the outer
+        /// divider, forming either a T (3 panes meet) or — if both
+        /// children are perpendicular splits AND their inner ratios
+        /// align — a + (4 panes meet at one point).
+        ///
+        /// At least one of `left` / `right` is non-null whenever this
+        /// struct is returned. With both populated and the inner ratios
+        /// approximately equal it is geometrically a +-junction; with
+        /// both populated but ratios differing it is two independent
+        /// T-junctions stacked along the outer divider.
+        ///
+        /// Only IMMEDIATE children of `outer` are inspected: a perpendicular
+        /// split nested deeper than one level down does not terminate against
+        /// `outer`'s divider and therefore does not form a junction with it.
+        pub const Junction = struct {
+            outer: Node.Handle,
+            /// Inner perpendicular split on the left/top child, if any.
+            left: ?Node.Handle,
+            /// Inner perpendicular split on the right/bottom child, if any.
+            right: ?Node.Handle,
+        };
+
+        /// Maximum difference (in normalized [0,1] ratio terms) between the
+        /// two inner ratios of a junction for them to be treated as a single
+        /// aligned +-junction rather than two independent stacked T-junctions.
+        ///
+        /// When dragging a +-junction the two inner dividers move in lockstep
+        /// so the 4-way intersection stays a single point; this epsilon is the
+        /// tolerance used to decide whether that lockstep applies. The query
+        /// `junctionAt` does not impose it (alignment is a presentation
+        /// concern) — apprts use this shared default when rendering drags.
+        pub const junction_plus_epsilon: f16 = 0.005;
+
         /// Initialize a new tree with a single view.
         pub fn init(gpa: Allocator, view: *View) Allocator.Error!Self {
             var arena = ArenaAllocator.init(gpa);
@@ -729,6 +764,54 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
+        /// The result of `detach`: the remaining tree with the leaf removed
+        /// (its sibling taking its place, per `remove` semantics) plus a new
+        /// single-leaf tree holding the detached view. Both trees are
+        /// independently owned by the caller and must each be `deinit`ed.
+        pub const Detached = struct {
+            /// The original tree with the detached leaf removed. Empty if the
+            /// detached leaf was the whole tree (the only leaf).
+            remaining: Self,
+            /// A new tree containing just the detached view.
+            detached: Self,
+        };
+
+        /// "Pop a pane out": given a leaf `at`, return both the tree with that
+        /// leaf removed (its sibling taking its place) and a fresh single-leaf
+        /// tree containing the detached view.
+        ///
+        /// `at` must reference a leaf node. Detaching the only leaf (the root
+        /// of a single-view tree) yields an empty `remaining` tree and a
+        /// single-leaf `detached` tree, effectively re-homing the same view.
+        ///
+        /// Ownership: views are reference counted. The detached view gains one
+        /// ref for the new single-leaf `detached` tree (via `init`); the
+        /// surviving views are ref'd for `remaining` (via `remove`). `self` is
+        /// left untouched and the caller still owns its refs, so it must be
+        /// `deinit`ed independently as usual. On error nothing is leaked.
+        pub fn detach(
+            self: *Self,
+            gpa: Allocator,
+            at: Node.Handle,
+        ) Allocator.Error!Detached {
+            assert(at.idx() < self.nodes.len);
+            const view = switch (self.nodes[at.idx()]) {
+                .leaf => |v| v,
+                .split => unreachable, // `at` must be a leaf
+            };
+
+            // A fresh single-leaf tree for the detached view. `init` takes the
+            // extra ref this new tree needs.
+            var detached = try Self.init(gpa, view);
+            errdefer detached.deinit();
+
+            // The remaining tree with the leaf removed. `remove` handles the
+            // sibling-promotion and refs the surviving views itself.
+            const remaining = try self.remove(gpa, at);
+
+            return .{ .remaining = remaining, .detached = detached };
+        }
+
         /// Reference all the nodes in the given slice, handling unref if
         /// any fail. This should be called LAST so you don't have to undo
         /// the refs at any further point after this.
@@ -881,6 +964,50 @@ pub fn SplitTree(comptime V: type) type {
                 parent_handle,
                 @min(@max(new_ratio, 0), 1),
             );
+            return result;
+        }
+
+        /// If `outer` is a split node whose child on either side is itself
+        /// a split of the perpendicular layout, return the junction info.
+        /// Returns null if `outer` is a leaf, both children are leaves, or
+        /// neither child is a perpendicular split.
+        ///
+        /// Only the IMMEDIATE children of `outer` are inspected. A
+        /// perpendicular split nested deeper does not terminate against
+        /// `outer`'s divider and so does not form a junction with it.
+        ///
+        /// Both `left` and `right` may be populated, in which case the
+        /// caller distinguishes a single +-junction (inner ratios align
+        /// within some epsilon) from two stacked T-junctions (ratios
+        /// differ). This helper does not impose an epsilon — that's a
+        /// presentation concern.
+        pub fn junctionAt(self: *const Self, outer: Node.Handle) ?Junction {
+            if (@intFromEnum(outer) >= self.nodes.len) return null;
+            const s = switch (self.nodes[outer.idx()]) {
+                .split => |sp| sp,
+                .leaf => return null,
+            };
+
+            var result: Junction = .{ .outer = outer, .left = null, .right = null };
+
+            if (s.left.idx() < self.nodes.len) {
+                switch (self.nodes[s.left.idx()]) {
+                    .split => |cs| if (cs.layout != s.layout) {
+                        result.left = s.left;
+                    },
+                    .leaf => {},
+                }
+            }
+            if (s.right.idx() < self.nodes.len) {
+                switch (self.nodes[s.right.idx()]) {
+                    .split => |cs| if (cs.layout != s.layout) {
+                        result.right = s.right;
+                    },
+                    .leaf => {},
+                }
+            }
+
+            if (result.left == null and result.right == null) return null;
             return result;
         }
 
@@ -2514,4 +2641,284 @@ test "SplitTree: remove and zoom" {
             \\
         );
     }
+}
+
+test "SplitTree: junctionAt returns null for empty / leaf" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var empty: TestTree = .empty;
+    defer empty.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), empty.junctionAt(.root));
+
+    var v: TestView = .{ .label = "A" };
+    var single: TestTree = try .init(alloc, &v);
+    defer single.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), single.junctionAt(.root));
+}
+
+test "SplitTree: junctionAt returns null for no perpendicular child" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B — both children are leaves.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), s1.junctionAt(.root));
+
+    // A | (B | C) — right child is a same-layout split.
+    var v3: TestView = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const right_b: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, right_b, .right, 0.5, &t3);
+    defer s2.deinit();
+    try testing.expectEqual(@as(?TestTree.Junction, null), s2.junctionAt(.root));
+}
+
+test "SplitTree: junctionAt detects perpendicular right child" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B then split B downward => A | (B / C). Outer .horizontal,
+    // right child becomes .vertical.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+
+    var v3: TestView = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const b_handle: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, b_handle, .down, 0.5, &t3);
+    defer s2.deinit();
+
+    const j = s2.junctionAt(.root) orelse return error.JunctionNotFound;
+    try testing.expectEqual(TestTree.Node.Handle.root, j.outer);
+    try testing.expectEqual(@as(?TestTree.Node.Handle, null), j.left);
+    const inner = j.right orelse return error.RightMissing;
+    switch (s2.nodes[inner.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerNotASplit,
+    }
+}
+
+test "SplitTree: junctionAt detects perpendicular left child" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B then split A downward => (A / D) | B.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+
+    var v3: TestView = .{ .label = "D" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const a_handle: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "A")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, a_handle, .down, 0.5, &t3);
+    defer s2.deinit();
+
+    const j = s2.junctionAt(.root) orelse return error.JunctionNotFound;
+    try testing.expectEqual(TestTree.Node.Handle.root, j.outer);
+    try testing.expectEqual(@as(?TestTree.Node.Handle, null), j.right);
+    const inner = j.left orelse return error.LeftMissing;
+    switch (s2.nodes[inner.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerNotASplit,
+    }
+}
+
+test "SplitTree: junctionAt detects both children perpendicular (potential +)" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B then split A downward and split B downward =>
+    // (A / D) | (B / E). Outer .horizontal, both children .vertical.
+    var v1: TestView = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestView = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var s1: TestTree = try t1.split(alloc, .root, .right, 0.5, &t2);
+    defer s1.deinit();
+
+    var v3: TestView = .{ .label = "D" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    const a_handle: TestTree.Node.Handle = at: {
+        var it = s1.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "A")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s2: TestTree = try s1.split(alloc, a_handle, .down, 0.5, &t3);
+    defer s2.deinit();
+
+    var v4: TestView = .{ .label = "E" };
+    var t4: TestTree = try .init(alloc, &v4);
+    defer t4.deinit();
+    const b_handle: TestTree.Node.Handle = at: {
+        var it = s2.iterator();
+        break :at while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) break entry.handle;
+        } else return error.NotFound;
+    };
+    var s3: TestTree = try s2.split(alloc, b_handle, .down, 0.5, &t4);
+    defer s3.deinit();
+
+    const j = s3.junctionAt(.root) orelse return error.JunctionNotFound;
+    try testing.expectEqual(TestTree.Node.Handle.root, j.outer);
+    const inner_left = j.left orelse return error.LeftMissing;
+    const inner_right = j.right orelse return error.RightMissing;
+    switch (s3.nodes[inner_left.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerLeftNotASplit,
+    }
+    switch (s3.nodes[inner_right.idx()]) {
+        .split => |sp| try testing.expectEqual(
+            TestTree.Split.Layout.vertical,
+            sp.layout,
+        ),
+        .leaf => return error.InnerRightNotASplit,
+    }
+}
+
+fn findLeaf(t: *const TestTree, label: []const u8) ?TestTree.Node.Handle {
+    var it = t.iterator();
+    return while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.view.label, label)) break entry.handle;
+    } else null;
+}
+
+fn labelAt(t: *const TestTree, h: TestTree.Node.Handle) []const u8 {
+    return switch (t.nodes[h.idx()]) {
+        .leaf => |v| v.label,
+        .split => "<split>",
+    };
+}
+
+test "SplitTree: detach from 2-pane split promotes sibling" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | B
+    var vA: TestView = .{ .label = "A" };
+    var tA: TestTree = try .init(alloc, &vA);
+    defer tA.deinit();
+    var vB: TestView = .{ .label = "B" };
+    var tB: TestTree = try .init(alloc, &vB);
+    defer tB.deinit();
+    var tree: TestTree = try tA.split(alloc, .root, .right, 0.5, &tB);
+    defer tree.deinit();
+
+    const b_handle = findLeaf(&tree, "B") orelse return error.NotFound;
+
+    var d = try tree.detach(alloc, b_handle);
+    defer d.remaining.deinit();
+    defer d.detached.deinit();
+
+    // Detached tree is a single leaf "B".
+    try testing.expect(!d.detached.isSplit());
+    try testing.expectEqualStrings("B", labelAt(&d.detached, .root));
+
+    // Remaining tree is just the sibling "A" at the root.
+    try testing.expect(!d.remaining.isSplit());
+    try testing.expectEqualStrings("A", labelAt(&d.remaining, .root));
+}
+
+test "SplitTree: detach from nested tree keeps the rest intact" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    // A | (B / C): detaching C should leave A | B.
+    var vA: TestView = .{ .label = "A" };
+    var tA: TestTree = try .init(alloc, &vA);
+    defer tA.deinit();
+    var vB: TestView = .{ .label = "B" };
+    var tB: TestTree = try .init(alloc, &vB);
+    defer tB.deinit();
+    var s1: TestTree = try tA.split(alloc, .root, .right, 0.5, &tB);
+    defer s1.deinit();
+    var vC: TestView = .{ .label = "C" };
+    var tC: TestTree = try .init(alloc, &vC);
+    defer tC.deinit();
+    const b_handle = findLeaf(&s1, "B") orelse return error.NotFound;
+    var tree: TestTree = try s1.split(alloc, b_handle, .down, 0.5, &tC);
+    defer tree.deinit();
+
+    const c_handle = findLeaf(&tree, "C") orelse return error.NotFound;
+
+    var d = try tree.detach(alloc, c_handle);
+    defer d.remaining.deinit();
+    defer d.detached.deinit();
+
+    // Detached single-leaf "C".
+    try testing.expect(!d.detached.isSplit());
+    try testing.expectEqualStrings("C", labelAt(&d.detached, .root));
+
+    // Remaining is A | B: still a split, with both A and B present and C gone.
+    try testing.expect(d.remaining.isSplit());
+    try testing.expect(findLeaf(&d.remaining, "A") != null);
+    try testing.expect(findLeaf(&d.remaining, "B") != null);
+    try testing.expect(findLeaf(&d.remaining, "C") == null);
+}
+
+test "SplitTree: detach the only leaf yields empty remaining" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var vA: TestView = .{ .label = "A" };
+    var tree: TestTree = try .init(alloc, &vA);
+    defer tree.deinit();
+
+    var d = try tree.detach(alloc, .root);
+    defer d.remaining.deinit();
+    defer d.detached.deinit();
+
+    // The only leaf re-homes into the detached tree; remaining is empty.
+    try testing.expect(d.remaining.isEmpty());
+    try testing.expect(!d.detached.isEmpty());
+    try testing.expectEqualStrings("A", labelAt(&d.detached, .root));
 }

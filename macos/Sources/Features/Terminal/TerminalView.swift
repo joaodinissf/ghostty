@@ -35,6 +35,10 @@ protocol TerminalViewModel: ObservableObject {
 
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
+
+    /// Registry that publishes split seam (divider/junction) hit-regions in
+    /// window coordinates so the AppKit surface event monitor can consult them.
+    var splitSeamRegistry: SplitSeamRegistry { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -83,6 +87,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         tree: viewModel.surfaceTree,
                         action: { delegate?.performSplitAction($0) })
                         .environmentObject(ghostty)
+                        .splitSeamRegistry(viewModel.splitSeamRegistry)
                         .ghosttyLastFocusedSurface(lastFocusedSurface)
                         .focused($focused)
                         .onAppear { self.focused = true }
@@ -121,8 +126,44 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                 if viewModel.updateOverlayIsVisible {
                     UpdateOverlay()
                 }
+
+                // Debug overlay that visualizes the published split seam
+                // hit-regions. Gated by the `GhosttyDebugSplitSeams` default
+                // so it ships disabled. Lets the registry be verified visually
+                // independent of the focus-gate change.
+                if UserDefaults.standard.bool(forKey: "GhosttyDebugSplitSeams") {
+                    SplitSeamDebugOverlay(registry: viewModel.splitSeamRegistry)
+                        .allowsHitTesting(false)
+                }
             }
             .frame(maxWidth: .greatestFiniteMagnitude, maxHeight: .greatestFiniteMagnitude)
+        }
+    }
+}
+
+/// Debug overlay that draws the regions currently published in the
+/// ``SplitSeamRegistry``. Regions are stored in SwiftUI global coordinates, so
+/// we translate them into this view's local space via its own global origin.
+private struct SplitSeamDebugOverlay: View {
+    @ObservedObject var registry: SplitSeamRegistry
+
+    var body: some View {
+        GeometryReader { geo in
+            let origin = geo.frame(in: .global).origin
+            ForEach(registry.regions) { region in
+                let local = region.rect.offsetBy(dx: -origin.x, dy: -origin.y)
+                Rectangle()
+                    .strokeBorder(color(for: region.kind), lineWidth: 1)
+                    .frame(width: local.width, height: local.height)
+                    .position(x: local.midX, y: local.midY)
+            }
+        }
+    }
+
+    private func color(for kind: SplitSeamRegistry.Kind) -> Color {
+        switch kind {
+        case .divider: return .green
+        case .junction: return .orange
         }
     }
 }

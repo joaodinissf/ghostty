@@ -156,6 +156,40 @@ Overlay terminal_page {
   [overlay]
   $GhosttyResizeOverlay resize_overlay {}
 
+  // Pop-out grab handle: a small Chrome-tab-style 3-dot affordance pinned to
+  // the top-center of the pane. Only shown when this surface is part of a
+  // split (is-split), since a single-pane window has nothing to pop out.
+  // Clicking it (or dragging it out) detaches this pane into a new window.
+  // The drag source carries the surface identity; activation (click) is the
+  // primary, most-portable trigger. See surface.zig: popoutPrepare /
+  // popoutDragEnd / popoutPressed.
+  [overlay]
+  Box popout_handle {
+    styles [
+      "popout-handle",
+    ]
+
+    visible: bind template.is-split;
+    halign: center;
+    valign: start;
+    can-focus: false;
+
+    Image {
+      icon-name: "view-more-symbolic";
+    }
+
+    GestureClick {
+      pressed => $popout_pressed();
+      button: 1;
+    }
+
+    DragSource popout_drag_source {
+      actions: move;
+      prepare => $popout_prepare();
+      drag-end => $popout_drag_end();
+    }
+  }
+
   [overlay]
   Label url_left {
     styles [

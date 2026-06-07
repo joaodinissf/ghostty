@@ -6,11 +6,27 @@ import SwiftUI
 /// exposed via this enum to the embedder to handle.
 enum TerminalSplitOperation {
     case resize(Resize)
+    case junctionResize(JunctionResize)
     case drop(Drop)
 
     struct Resize {
         let node: SplitTree<Ghostty.SurfaceView>.Node
         let ratio: Double
+    }
+
+    /// A coordinated drag of a junction where an outer divider and its
+    /// perpendicular inner divider(s) move together.
+    ///
+    /// `node` is captured once at gesture-begin (the outer split node). The
+    /// inner ratios are applied positionally to that node's children so the
+    /// whole junction is updated in a single tree edit, avoiding the
+    /// wrong-divider hazard of repeated structural lookups in symmetric
+    /// layouts.
+    struct JunctionResize {
+        let node: SplitTree<Ghostty.SurfaceView>.Node
+        let outerRatio: Double
+        let leftInnerRatio: Double?
+        let rightInnerRatio: Double?
     }
 
     struct Drop {
@@ -71,6 +87,8 @@ private struct TerminalSplitSubtreeView: View {
                 }),
                 dividerColor: ghostty.config.splitDividerColor,
                 resizeIncrements: .init(width: 1, height: 1),
+                seamID: node.structuralIdentity,
+                junction: junctionConfig(for: split, node: node),
                 left: {
                     TerminalSplitSubtreeView(node: split.left, action: action)
                 },
@@ -83,6 +101,44 @@ private struct TerminalSplitSubtreeView: View {
                 }
             )
         }
+    }
+
+    /// Builds the junction-drag overlay config for an outer split, if either of
+    /// its children is itself a *perpendicular* split (a split of the opposite
+    /// direction). Such a child's inner divider terminates against this outer
+    /// divider, forming a draggable T (one perpendicular child) or + (both)
+    /// junction.
+    ///
+    /// The drag emits a single `.junctionResize` capturing the outer node once
+    /// so the inner dividers are addressed positionally, avoiding the
+    /// wrong-divider hazard of repeated structural lookups in symmetric layouts.
+    private func junctionConfig(
+        for split: SplitTree<Ghostty.SurfaceView>.Node.Split,
+        node: SplitTree<Ghostty.SurfaceView>.Node
+    ) -> SplitJunctionConfig? {
+        let leftInner = perpendicularRatio(of: split.left, outer: split.direction)
+        let rightInner = perpendicularRatio(of: split.right, outer: split.direction)
+        guard leftInner != nil || rightInner != nil else { return nil }
+
+        return SplitJunctionConfig(
+            leftInnerRatio: leftInner.map { CGFloat($0) },
+            rightInnerRatio: rightInner.map { CGFloat($0) }
+        ) { outerRatio, leftInnerRatio, rightInnerRatio in
+            action(.junctionResize(.init(
+                node: node,
+                outerRatio: Double(outerRatio),
+                leftInnerRatio: leftInnerRatio.map { Double($0) },
+                rightInnerRatio: rightInnerRatio.map { Double($0) })))
+        }
+    }
+
+    /// The ratio of `child` if it is a split perpendicular to `outer`, else nil.
+    private func perpendicularRatio(
+        of child: SplitTree<Ghostty.SurfaceView>.Node,
+        outer: SplitTree<Ghostty.SurfaceView>.Direction
+    ) -> Double? {
+        guard case .split(let inner) = child, inner.direction != outer else { return nil }
+        return inner.ratio
     }
 }
 

@@ -33,6 +33,7 @@ const ChildExited = @import("surface_child_exited.zig").SurfaceChildExited;
 const ClipboardConfirmationDialog = @import("clipboard_confirmation_dialog.zig").ClipboardConfirmationDialog;
 const TitleDialog = @import("title_dialog.zig").TitleDialog;
 const Window = @import("window.zig").Window;
+const SplitTree = @import("split_tree.zig").SplitTree;
 const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
 const i18n = @import("../../../os/i18n.zig");
 const media = @import("../media.zig");
@@ -2624,6 +2625,71 @@ pub const Surface = extern struct {
         priv.inspector = null;
     }
 
+    //---------------------------------------------------------------
+    // Pop-out (detach pane into a new window)
+
+    /// Detach this pane (surface) out of its split tree and into a new window.
+    /// No-op if this surface isn't currently part of a multi-pane split tree.
+    ///
+    /// NOTE(gtk-untested): net-new. We locate the ancestor SplitTree and hand
+    /// off to `SplitTree.popoutSurface`, which performs the core `detach`,
+    /// re-homes the detached pane in a fresh window, and updates this tree.
+    fn popout(self: *Self) void {
+        const split_tree = ext.getAncestor(
+            SplitTree,
+            self.as(gtk.Widget),
+        ) orelse {
+            log.warn("popout requested but no ancestor SplitTree found", .{});
+            return;
+        };
+
+        // popoutSurface guards single-pane trees (returns false) so a
+        // single-pane window is a safe no-op here.
+        _ = split_tree.popoutSurface(self);
+    }
+
+    /// GestureClick on the 3-dot pop-out handle: pop this pane out. Clicking
+    /// is the primary, most portable pop-out trigger (DnD-outside-window
+    /// detection varies across compositors).
+    fn popoutPressed(
+        _: *gtk.GestureClick,
+        _: c_int,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        self.popout();
+    }
+
+    /// DragSource `prepare` on the pop-out handle: offer a content provider
+    /// carrying this surface's identity (the Surface GObject itself). This is
+    /// what makes the handle draggable; the actual re-home happens in
+    /// `popoutDragEnd` (or via the click activation above).
+    fn popoutPrepare(
+        _: *gtk.DragSource,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) ?*gdk.ContentProvider {
+        var value = gobject.ext.Value.newFrom(self);
+        defer value.unset();
+        return gdk.ContentProvider.newForValue(&value);
+    }
+
+    /// DragSource `drag-end` on the pop-out handle: the user dragged the pane
+    /// handle and released it. We pop out the pane into a new window. We do
+    /// this unconditionally on drag-end (rather than only on a true
+    /// drop-outside-window, which is unreliable to detect portably): the
+    /// gesture itself is the explicit "tear this pane out" intent.
+    fn popoutDragEnd(
+        _: *gtk.DragSource,
+        _: *gdk.Drag,
+        _: c_int,
+        self: *Self,
+    ) callconv(.c) void {
+        self.popout();
+    }
+
     fn dtDrop(
         _: *gtk.DropTarget,
         value: *gobject.Value,
@@ -3633,6 +3699,9 @@ pub const Surface = extern struct {
             class.bindTemplateCallback("scroll_vertical_end", &ecMouseScrollVerticalPrecisionEnd);
             class.bindTemplateCallback("scroll_horizontal", &ecMouseScrollHorizontal);
             class.bindTemplateCallback("drop", &dtDrop);
+            class.bindTemplateCallback("popout_pressed", &popoutPressed);
+            class.bindTemplateCallback("popout_prepare", &popoutPrepare);
+            class.bindTemplateCallback("popout_drag_end", &popoutDragEnd);
             class.bindTemplateCallback("gl_realize", &glareaRealize);
             class.bindTemplateCallback("gl_unrealize", &glareaUnrealize);
             class.bindTemplateCallback("gl_map", &glareaMap);

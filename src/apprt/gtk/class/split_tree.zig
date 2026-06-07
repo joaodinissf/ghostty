@@ -2,6 +2,7 @@ const std = @import("std");
 const assert = @import("../../../quirks.zig").inlineAssert;
 const Allocator = std.mem.Allocator;
 const adw = @import("adw");
+const gdk = @import("gdk");
 const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
@@ -282,6 +283,72 @@ pub const SplitTree = extern struct {
 
         // Replace our tree
         self.setTree(&new_tree);
+    }
+
+    /// Pop the given surface out of this split tree and into a brand-new
+    /// window. The surface is removed from this tree (its sibling is promoted
+    /// in its place via the core `detach` helper) and re-homed as the sole
+    /// pane of a fresh window.
+    ///
+    /// No-op (returns false) if `surface` isn't found in this tree or if this
+    /// tree is a single pane (nothing to pop out of). Returns true if the pane
+    /// was popped out.
+    ///
+    /// NOTE(gtk-untested): this is net-new behavior with no prototype
+    /// reference. The flow is:
+    ///   1. find the leaf handle of `surface` in our current tree;
+    ///   2. guard against single-pane trees (root is a leaf);
+    ///   3. call core `detach(handle)` -> { remaining, detached };
+    ///   4. set `remaining` as our tree (sibling promoted, surface gone);
+    ///   5. ask the Application to open a new window adopting `detached`.
+    /// Ownership: `detach` hands us two independently-owned trees. We pass
+    /// `&remaining`/`&detached` to `setTree`/`newWindowWithTree`, which CLONE
+    /// (boxedCopy) them, so we still own and must `deinit` both locally.
+    pub fn popoutSurface(self: *Self, surface: *Surface) bool {
+        const tree = self.getTree() orelse return false;
+
+        // A single-pane tree has nothing to pop out of: the root is a leaf.
+        switch (tree.nodes[@as(Surface.Tree.Node.Handle, .root).idx()]) {
+            .leaf => return false,
+            .split => {},
+        }
+
+        // Find the handle of the surface within our tree.
+        const handle: Surface.Tree.Node.Handle = handle: {
+            var it = tree.iterator();
+            while (it.next()) |entry| {
+                if (entry.view == surface) break :handle entry.handle;
+            }
+            // Surface isn't in this tree (shouldn't happen for a child).
+            return false;
+        };
+
+        const alloc = Application.default().allocator();
+
+        // Detach: produces a `remaining` tree (with the leaf removed and its
+        // sibling promoted) and a fresh single-leaf `detached` tree.
+        var detached = tree.detach(alloc, handle) catch |err| {
+            log.warn("failed to detach surface for pop-out err={}", .{err});
+            return false;
+        };
+        defer detached.remaining.deinit();
+        defer detached.detached.deinit();
+
+        log.debug(
+            "popping out surface handle={} remaining={f} detached={f}",
+            .{ handle, &detached.remaining, &detached.detached },
+        );
+
+        // Open a new window adopting the detached subtree FIRST. If this
+        // fails we leave our own tree untouched so the surface isn't lost.
+        Application.default().newWindowWithTree(&detached.detached) catch |err| {
+            log.warn("failed to open new window for pop-out err={}", .{err});
+            return false;
+        };
+
+        // Now drop the surface from our tree (sibling promoted).
+        self.setTree(&detached.remaining);
+        return true;
     }
 
     pub fn resize(
@@ -971,6 +1038,7 @@ pub const SplitTree = extern struct {
                 defer right.deinit();
 
                 break :split .initNew(SplitTreeSplit.new(
+                    tree,
                     current,
                     &s,
                     left.widget,
@@ -1105,6 +1173,12 @@ const SplitTreeSplit = extern struct {
         /// Assumed to be correct.
         handle: Surface.Tree.Node.Handle,
 
+        /// The layout (orientation) of this split, cached from the tree at
+        /// construction time. The Paned's orientation reflects this; storing
+        /// it here saves us querying GtkOrientable on every drag/position
+        /// callback.
+        layout: Surface.Tree.Split.Layout = .horizontal,
+
         /// Source to handle repositioning the split when properties change.
         idle: ?c_uint = null,
 
@@ -1116,6 +1190,42 @@ const SplitTreeSplit = extern struct {
 
         // Template bindings
         paned: *gtk.Paned,
+        overlay: *gtk.Overlay,
+
+        /// Junction handle widgets, if this split has a perpendicular inner
+        /// split on the corresponding side. Both null in the common
+        /// no-junction case. The widgets are owned by `overlay` once added.
+        junction_handle_left: ?*gtk.Widget = null,
+        junction_handle_right: ?*gtk.Widget = null,
+
+        /// References to the inner perpendicular SplitTreeSplits, used at
+        /// drag time to look up and update their `Paned.position`. Cleared
+        /// in `dispose`.
+        junction_inner_left: ?*SplitTreeSplit = null,
+        junction_inner_right: ?*SplitTreeSplit = null,
+
+        /// State captured at drag-begin so drag-update can compute
+        /// absolute positions from gesture offsets without re-reading the
+        /// (now-moving) Paned positions mid-drag.
+        drag_outer_start: c_int = 0,
+        drag_inner_start: c_int = 0,
+        /// If true, the current drag is a `+`-junction: update both inners
+        /// in lockstep with the same new perpendicular position.
+        drag_plus_lockstep: bool = false,
+        drag_inner_other_start: c_int = 0,
+
+        /// The handle widget currently being dragged, if any. While set, the
+        /// `get-child-position` callback freezes that widget's allocation to
+        /// `drag_handle_alloc` instead of recomputing it from the Paneds.
+        /// This is what stops `GtkGestureDrag`'s widget-local offsets from
+        /// drifting as the dividers move under the cursor.
+        drag_active_widget: ?*gtk.Widget = null,
+        drag_handle_alloc: gdk.Rectangle = .{
+            .f_x = 0,
+            .f_y = 0,
+            .f_width = 0,
+            .f_height = 0,
+        },
 
         pub var offset: c_int = 0;
     };
@@ -1126,6 +1236,7 @@ const SplitTreeSplit = extern struct {
     /// an immutable widget and we don't want to deal with the overhead of
     /// all the boilerplate for properties, signals, bindings, etc.
     pub fn new(
+        tree: *const Surface.Tree,
         handle: Surface.Tree.Node.Handle,
         split: *const Surface.Tree.Split,
         start_child: *gtk.Widget,
@@ -1134,6 +1245,7 @@ const SplitTreeSplit = extern struct {
         const self = gobject.ext.newInstance(Self, .{});
         const priv = self.private();
         priv.handle = handle;
+        priv.layout = split.layout;
 
         // Setup our paned fields
         const paned = priv.paned;
@@ -1146,7 +1258,299 @@ const SplitTreeSplit = extern struct {
 
         // Signals and so on are setup in the template.
 
+        // If this split has perpendicular inner children, install junction
+        // drag handles on top of the Paned via the overlay.
+        self.setupJunction(tree, handle, start_child, end_child);
+
         return self;
+    }
+
+    /// Side length of the invisible junction hit zone. Sized slightly larger
+    /// than GtkPaned's resize-handle width so it wins hit-testing inside the
+    /// small corner area where two perpendicular dividers meet.
+    const junction_hit_size: c_int = 12;
+
+    /// Install junction-drag handles on the overlay for any perpendicular
+    /// inner split. We query the CORE `junctionAt` helper to decide whether a
+    /// junction exists (and on which sides), so the geometric definition of a
+    /// junction stays in one place (`datastruct/split_tree.zig`).
+    ///
+    /// IMPORTANT (untested-on-macOS implementation note): unlike the core
+    /// `junctionResize` helper — which produces a *new* tree with coordinated
+    /// ratios — this widget performs the actual drag entirely in GtkPaned
+    /// pixel space (`Paned.setPosition`) and never rebuilds the tree during
+    /// the gesture. See `onJunctionDragUpdate` for why. The new ratios get
+    /// persisted back into the tree through the EXISTING position-notify ->
+    /// onIdle path once the Paned positions settle. We therefore deliberately
+    /// do NOT call `junctionResize`; we only reuse `junctionAt` and the shared
+    /// `junction_plus_epsilon` constant.
+    fn setupJunction(
+        self: *Self,
+        tree: *const Surface.Tree,
+        handle: Surface.Tree.Node.Handle,
+        start_child: *gtk.Widget,
+        end_child: *gtk.Widget,
+    ) void {
+        const j = tree.junctionAt(handle) orelse return;
+        const priv = self.private();
+
+        if (j.left != null) {
+            if (gobject.ext.cast(SplitTreeSplit, start_child)) |inner| {
+                priv.junction_inner_left = inner;
+                priv.junction_handle_left = createJunctionHandle(self);
+                priv.overlay.addOverlay(priv.junction_handle_left.?);
+            }
+        }
+        if (j.right != null) {
+            if (gobject.ext.cast(SplitTreeSplit, end_child)) |inner| {
+                priv.junction_inner_right = inner;
+                priv.junction_handle_right = createJunctionHandle(self);
+                priv.overlay.addOverlay(priv.junction_handle_right.?);
+            }
+        }
+
+        // Bail if we ended up not installing anything (e.g. the cast above
+        // failed unexpectedly).
+        if (priv.junction_handle_left == null and priv.junction_handle_right == null) return;
+
+        // Position each handle dynamically: its location depends on the
+        // outer Paned position (which the user may be dragging right now)
+        // and the inner Paned position (which the user may also be dragging).
+        _ = gtk.Overlay.signals.get_child_position.connect(
+            priv.overlay,
+            *Self,
+            &onJunctionChildPosition,
+            self,
+            .{},
+        );
+    }
+
+    fn createJunctionHandle(self: *Self) *gtk.Widget {
+        const box = gtk.Box.new(.horizontal, 0);
+        const widget = box.as(gtk.Widget);
+        widget.setSizeRequest(junction_hit_size, junction_hit_size);
+        widget.setCursorFromName("crosshair");
+        // We don't want the overlay's main-child (the Paned) to expand to
+        // fill our junction handle: keep our handle at its requested size.
+        widget.setHalign(.start);
+        widget.setValign(.start);
+
+        const gesture = gtk.GestureDrag.new();
+        _ = gtk.GestureDrag.signals.drag_begin.connect(
+            gesture,
+            *Self,
+            &onJunctionDragBegin,
+            self,
+            .{},
+        );
+        _ = gtk.GestureDrag.signals.drag_update.connect(
+            gesture,
+            *Self,
+            &onJunctionDragUpdate,
+            self,
+            .{},
+        );
+        _ = gtk.GestureDrag.signals.drag_end.connect(
+            gesture,
+            *Self,
+            &onJunctionDragEnd,
+            self,
+            .{},
+        );
+        widget.addController(gesture.as(gtk.EventController));
+
+        return widget;
+    }
+
+    /// Return the inner Paned associated with the given junction-handle
+    /// widget, or null if `widget` isn't one of our two handles.
+    fn innerPanedFor(self: *Self, widget: *gtk.Widget) ?*gtk.Paned {
+        const priv = self.private();
+        if (priv.junction_handle_left) |h| {
+            if (h == widget) return priv.junction_inner_left.?.private().paned;
+        }
+        if (priv.junction_handle_right) |h| {
+            if (h == widget) return priv.junction_inner_right.?.private().paned;
+        }
+        return null;
+    }
+
+    /// Return the "other" inner Paned — the one not bound to the dragged
+    /// handle. Used for the `+`-junction lockstep update.
+    fn otherInnerPaned(self: *Self, widget: *gtk.Widget) ?*gtk.Paned {
+        const priv = self.private();
+        if (priv.junction_handle_left) |h| {
+            if (h == widget) {
+                if (priv.junction_inner_right) |inner| return inner.private().paned;
+                return null;
+            }
+        }
+        if (priv.junction_handle_right) |h| {
+            if (h == widget) {
+                if (priv.junction_inner_left) |inner| return inner.private().paned;
+                return null;
+            }
+        }
+        return null;
+    }
+
+    fn onJunctionChildPosition(
+        _: *gtk.Overlay,
+        widget: *gtk.Widget,
+        allocation: *gdk.Rectangle,
+        self: *Self,
+    ) callconv(.c) c_int {
+        const priv = self.private();
+        const inner_paned = self.innerPanedFor(widget) orelse return 0;
+
+        // While a drag is in progress on this handle, freeze its allocation
+        // to where it was at drag-start. Moving it under the cursor breaks
+        // GtkGestureDrag's widget-local offset arithmetic and causes the
+        // cursor-vs-handle gap to grow linearly with drag distance.
+        if (priv.drag_active_widget) |dw| if (dw == widget) {
+            allocation.* = priv.drag_handle_alloc;
+            return 1;
+        };
+
+        const outer_pos = priv.paned.getPosition();
+        const inner_pos = inner_paned.getPosition();
+        const half = @divTrunc(junction_hit_size, 2);
+
+        switch (priv.layout) {
+            .horizontal => {
+                allocation.f_x = outer_pos - half;
+                allocation.f_y = inner_pos - half;
+            },
+            .vertical => {
+                allocation.f_x = inner_pos - half;
+                allocation.f_y = outer_pos - half;
+            },
+        }
+        allocation.f_width = junction_hit_size;
+        allocation.f_height = junction_hit_size;
+        return 1;
+    }
+
+    fn onJunctionDragBegin(
+        gesture: *gtk.GestureDrag,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const widget = gesture.as(gtk.EventController).getWidget() orelse return;
+        const inner_paned = self.innerPanedFor(widget) orelse return;
+
+        priv.drag_outer_start = priv.paned.getPosition();
+        priv.drag_inner_start = inner_paned.getPosition();
+
+        // Freeze the handle widget's allocation for the duration of the drag
+        // so the gesture's reported offsets stay anchored to a stable frame.
+        priv.drag_active_widget = widget;
+        const half = @divTrunc(junction_hit_size, 2);
+        switch (priv.layout) {
+            .horizontal => {
+                priv.drag_handle_alloc.f_x = priv.drag_outer_start - half;
+                priv.drag_handle_alloc.f_y = priv.drag_inner_start - half;
+            },
+            .vertical => {
+                priv.drag_handle_alloc.f_x = priv.drag_inner_start - half;
+                priv.drag_handle_alloc.f_y = priv.drag_outer_start - half;
+            },
+        }
+        priv.drag_handle_alloc.f_width = junction_hit_size;
+        priv.drag_handle_alloc.f_height = junction_hit_size;
+
+        // Decide whether this is a `+`-junction drag: both inners present,
+        // currently at approximately the same perpendicular position. We
+        // compare normalized ratios against the SHARED core epsilon
+        // (`Surface.Tree.junction_plus_epsilon`) so the GTK lockstep
+        // threshold can never drift from the core's lockstep threshold.
+        priv.drag_plus_lockstep = false;
+        if (self.otherInnerPaned(widget)) |other| {
+            const other_pos = other.getPosition();
+            const this_pos: f64 = @floatFromInt(priv.drag_inner_start);
+            const other_pos_f: f64 = @floatFromInt(other_pos);
+            const max_extent: f64 = perpendicularExtent: {
+                // Use the perpendicular axis size of the outer Paned. For a
+                // horizontal split (vertical divider) the perpendicular axis
+                // is the height; for a vertical split it's the width.
+                const paned_widget = priv.paned.as(gtk.Widget);
+                const a: f64 = @floatFromInt(paned_widget.getHeight());
+                const b: f64 = @floatFromInt(paned_widget.getWidth());
+                break :perpendicularExtent switch (priv.layout) {
+                    .horizontal => a,
+                    .vertical => b,
+                };
+            };
+            if (max_extent > 0) {
+                const this_ratio = this_pos / max_extent;
+                const other_ratio = other_pos_f / max_extent;
+                const epsilon: f64 = Surface.Tree.junction_plus_epsilon;
+                if (@abs(this_ratio - other_ratio) < epsilon) {
+                    priv.drag_plus_lockstep = true;
+                    priv.drag_inner_other_start = other_pos;
+                }
+            }
+        }
+    }
+
+    fn onJunctionDragUpdate(
+        gesture: *gtk.GestureDrag,
+        offset_x: f64,
+        offset_y: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const widget = gesture.as(gtk.EventController).getWidget() orelse return;
+        const inner_paned = self.innerPanedFor(widget) orelse return;
+
+        const dx: c_int = @intFromFloat(@round(offset_x));
+        const dy: c_int = @intFromFloat(@round(offset_y));
+
+        // The outer divider moves along this split's own axis; the inner
+        // (perpendicular) divider moves along the other axis. We drive both
+        // GtkPaneds directly in pixel space. We intentionally do NOT call the
+        // core `junctionResize` here: that helper returns a brand-new tree,
+        // which would force a full widget-tree rebuild on every motion event,
+        // tearing down and recreating the very SplitTreeSplit widgets (and the
+        // GestureDrag) mid-gesture. Live GtkPaned manipulation keeps the drag
+        // smooth; the resulting ratios are persisted to the tree afterwards by
+        // the existing position-notify -> onIdle path.
+        const outer_delta: c_int = switch (priv.layout) {
+            .horizontal => dx,
+            .vertical => dy,
+        };
+        const inner_delta: c_int = switch (priv.layout) {
+            .horizontal => dy,
+            .vertical => dx,
+        };
+
+        priv.paned.setPosition(priv.drag_outer_start + outer_delta);
+        inner_paned.setPosition(priv.drag_inner_start + inner_delta);
+
+        if (priv.drag_plus_lockstep) {
+            if (self.otherInnerPaned(widget)) |other| {
+                other.setPosition(priv.drag_inner_other_start + inner_delta);
+            }
+        }
+    }
+
+    fn onJunctionDragEnd(
+        _: *gtk.GestureDrag,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        priv.drag_active_widget = null;
+        priv.drag_plus_lockstep = false;
+
+        // The handle has been frozen in place throughout the drag. Now that
+        // the drag is over, re-run the overlay's layout so the handle snaps
+        // to its new geometric position (recomputed from the current Paned
+        // positions).
+        priv.overlay.as(gtk.Widget).queueResize();
     }
 
     fn init(self: *Self, _: *Class) callconv(.c) void {
@@ -1307,6 +1711,17 @@ const SplitTreeSplit = extern struct {
             priv.idle = null;
         }
 
+        // Clear the cached pointers to the inner perpendicular splits and
+        // their handle widgets so nothing dangles after dispose. The handle
+        // widgets are owned by `overlay` (disposed via disposeTemplate below);
+        // the inner splits are owned by the Paned. We only null our borrowed
+        // references here — we do not unref/unparent them ourselves.
+        priv.junction_inner_left = null;
+        priv.junction_inner_right = null;
+        priv.junction_handle_left = null;
+        priv.junction_handle_right = null;
+        priv.drag_active_widget = null;
+
         gtk.Widget.disposeTemplate(
             self.as(gtk.Widget),
             getGObjectType(),
@@ -1348,6 +1763,7 @@ const SplitTreeSplit = extern struct {
 
             // Bindings
             class.bindTemplateChildPrivate("paned", .{});
+            class.bindTemplateChildPrivate("overlay", .{});
 
             // Template Callbacks
             class.bindTemplateCallback("notify_max_position", &propMaxPosition);

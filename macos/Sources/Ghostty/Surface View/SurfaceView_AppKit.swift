@@ -651,6 +651,17 @@ extension Ghostty {
             // being used to transfer split focus. Consume it so it does not
             // get forwarded to the terminal as a mouse click.
             if NSApp.isActive && window.isKeyWindow {
+                // ...unless the click landed on a split seam (a divider or a
+                // junction-drag handle). Those are SwiftUI `DragGesture`s, and
+                // swallowing the event here would prevent the gesture from
+                // engaging on the first mouse-down when the bordering pane is
+                // unfocused. Returning the event lets SwiftUI see it. We do NOT
+                // override `acceptsFirstMouse` for this (see Issue 2595 note
+                // above) because that would also forward the click to the pty.
+                if isSeamClick(event, in: window) {
+                    return event
+                }
+
                 window.makeFirstResponder(self)
                 suppressNextLeftMouseUp = true
                 return nil
@@ -663,6 +674,28 @@ extension Ghostty {
             // focus the window and dispatch events. If you return nil here then
             // nobody gets a windowDidBecomeKey event and so on.
             return event
+        }
+
+        /// Returns true if the given left-mouse-down landed on a published
+        /// split seam (divider or junction handle) for this window.
+        ///
+        /// The registry stores regions in SwiftUI global coordinates: origin at
+        /// the top-left of the window content area, y pointing down. AppKit
+        /// gives us `locationInWindow` in the window's bottom-left coordinate
+        /// space, so we convert into the content view and flip the y-axis to
+        /// match SwiftUI before querying.
+        private func isSeamClick(_ event: NSEvent, in window: NSWindow) -> Bool {
+            guard let registry = (window.windowController as? BaseTerminalController)?
+                .splitSeamRegistry else { return false }
+            guard let contentView = window.contentView else { return false }
+
+            let contentPoint = contentView.convert(event.locationInWindow, from: nil)
+            // Flip from AppKit's bottom-left origin to SwiftUI's top-left
+            // origin. (The hosting view fills the content view.)
+            let globalPoint = CGPoint(
+                x: contentPoint.x,
+                y: contentView.bounds.height - contentPoint.y)
+            return registry.contains(globalPoint: globalPoint)
         }
 
         private func localEventKeyUp(_ event: NSEvent) -> NSEvent? {
