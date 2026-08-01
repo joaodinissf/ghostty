@@ -35,6 +35,9 @@ protocol TerminalViewModel: ObservableObject {
 
     /// The update overlay should be visible.
     var updateOverlayIsVisible: Bool { get }
+
+    /// Divider hit-regions used by the AppKit focus-transfer gate.
+    var splitSeamRegistry: SplitSeamRegistry { get }
 }
 
 /// The main terminal view. This terminal view supports splits.
@@ -83,6 +86,7 @@ struct TerminalView<ViewModel: TerminalViewModel>: View {
                         tree: viewModel.surfaceTree,
                         action: { delegate?.performSplitAction($0) })
                         .environmentObject(ghostty)
+                        .splitSeamRegistry(viewModel.splitSeamRegistry)
                         .ghosttyLastFocusedSurface(lastFocusedSurface)
                         .focused($focused)
                         .onAppear { self.focused = true }

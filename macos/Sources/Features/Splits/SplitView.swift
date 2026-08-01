@@ -24,8 +24,13 @@ struct SplitView<L: View, R: View>: View {
     /// Called when the divider is double-tapped to equalize splits.
     let onEqualize: () -> Void
 
+    /// Stable id for publishing this divider into ``SplitSeamRegistry``. Nil skips registration.
+    let seamID: AnyHashable?
+
     /// The minimum size (in points) of a split
     let minSize: CGFloat = 10
+
+    @Environment(\.splitSeamRegistry) private var seamRegistry
 
     /// The current fractional width of the split view. 0.5 means L/R are equally sized, for example.
     @Binding var split: CGFloat
@@ -65,7 +70,49 @@ struct SplitView<L: View, R: View>: View {
             }
             .accessibilityElement(children: .contain)
             .accessibilityLabel(splitViewLabel)
+            .onChange(of: dividerRegistration(in: geo)) { registration in
+                updateSeamRegistration(registration)
+            }
+            .onAppear {
+                updateSeamRegistration(dividerRegistration(in: geo))
+            }
+            .onDisappear {
+                if let seamID { seamRegistry?.unregister(id: seamID) }
+            }
         }
+    }
+
+    /// Divider hit-region in SwiftUI global coordinates, or nil when registration is disabled.
+    private func dividerRegistration(in geo: GeometryProxy) -> SeamRegistration? {
+        guard let seamID else { return nil }
+        let globalOrigin = geo.frame(in: .global).origin
+        let splitterPoint = self.splitterPoint(for: geo.size, leftRect: leftRect(for: geo.size))
+        let hitThickness = splitterVisibleSize + splitterInvisibleSize
+        let localRect: CGRect = switch direction {
+        case .horizontal:
+            CGRect(x: splitterPoint.x - hitThickness / 2, y: 0,
+                   width: hitThickness, height: geo.size.height)
+        case .vertical:
+            CGRect(x: 0, y: splitterPoint.y - hitThickness / 2,
+                   width: geo.size.width, height: hitThickness)
+        }
+        return SeamRegistration(
+            id: seamID,
+            rect: localRect.offsetBy(dx: globalOrigin.x, dy: globalOrigin.y))
+    }
+
+    private func updateSeamRegistration(_ registration: SeamRegistration?) {
+        guard let seamRegistry else { return }
+        guard let registration else {
+            if let seamID { seamRegistry.unregister(id: seamID) }
+            return
+        }
+        seamRegistry.register(id: registration.id, rect: registration.rect)
+    }
+
+    private struct SeamRegistration: Equatable {
+        let id: AnyHashable
+        let rect: CGRect
     }
 
     /// Initialize a split view that can be resized by manually dragging the divider.
@@ -74,6 +121,7 @@ struct SplitView<L: View, R: View>: View {
         _ split: Binding<CGFloat>,
         dividerColor: Color,
         resizeIncrements: NSSize = .init(width: 1, height: 1),
+        seamID: AnyHashable? = nil,
         @ViewBuilder left: (() -> L),
         @ViewBuilder right: (() -> R),
         onEqualize: @escaping () -> Void
@@ -82,6 +130,7 @@ struct SplitView<L: View, R: View>: View {
         self._split = split
         self.dividerColor = dividerColor
         self.resizeIncrements = resizeIncrements
+        self.seamID = seamID
         self.left = left()
         self.right = right()
         self.onEqualize = onEqualize

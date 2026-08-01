@@ -670,6 +670,13 @@ extension Ghostty {
             // being used to transfer split focus. Consume it so it does not
             // get forwarded to the terminal as a mouse click.
             if NSApp.isActive && window.isKeyWindow {
+                // Exception: divider hit-regions. Swallowing here prevents the
+                // SwiftUI DragGesture from starting on first press over an
+                // unfocused pane. Do not use acceptsFirstMouse (Issue 2595).
+                if isSplitSeamClick(event, in: window) {
+                    return event
+                }
+
                 window.makeFirstResponder(self)
                 suppressNextLeftMouseUp = true
                 return nil
@@ -682,6 +689,22 @@ extension Ghostty {
             // focus the window and dispatch events. If you return nil here then
             // nobody gets a windowDidBecomeKey event and so on.
             return event
+        }
+
+        /// True when the click is inside a registered split-divider hit-region.
+        ///
+        /// Registry coords are SwiftUI global (content top-left, y-down). AppKit
+        /// gives bottom-left window points; convert and flip y before querying.
+        private func isSplitSeamClick(_ event: NSEvent, in window: NSWindow) -> Bool {
+            guard let registry = (window.windowController as? BaseTerminalController)?
+                .splitSeamRegistry else { return false }
+            guard let contentView = window.contentView else { return false }
+
+            let contentPoint = contentView.convert(event.locationInWindow, from: nil)
+            let globalPoint = CGPoint(
+                x: contentPoint.x,
+                y: contentView.bounds.height - contentPoint.y)
+            return registry.contains(globalPoint: globalPoint)
         }
 
         private func localEventKeyUp(_ event: NSEvent) -> NSEvent? {

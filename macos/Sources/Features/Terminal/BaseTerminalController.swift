@@ -45,6 +45,9 @@ class BaseTerminalController: NSWindowController,
         didSet { surfaceTreeDidChange(from: oldValue, to: surfaceTree) }
     }
 
+    /// Divider hit-regions for the AppKit focus-transfer gate (see ``SplitSeamRegistry``).
+    let splitSeamRegistry = SplitSeamRegistry()
+
     /// This can be set to show/hide the command palette.
     @Published var commandPaletteIsShowing: Bool = false
 
