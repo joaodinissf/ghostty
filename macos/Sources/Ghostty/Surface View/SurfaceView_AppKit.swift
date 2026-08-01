@@ -191,11 +191,11 @@ extension Ghostty {
         // This is set to non-null during keyDown to accumulate insertText contents
         private var keyTextAccumulator: [String]?
 
-        // Focus-transfer clicks must not be encoded to the PTY, but the
-        // NSEvent still has to reach SwiftUI (e.g. split-divider DragGesture).
-        // The local monitor marks the sequence; mouseDown/mouseUp honor it.
-        private var suppressNextLeftMouseDown: Bool = false
-        private var suppressNextLeftMouseUp: Bool = false
+        // Focus-transfer left-button sequence: native dispatch continues so
+        // SwiftUI can run (e.g. split-divider DragGesture), but SurfaceView
+        // must not encode press/drag/pressure/release to the PTY. Armed in the
+        // local monitor; held through mouseUp (or reset on the next left down).
+        private var suppressLeftMouseSequence: Bool = false
 
         // A small delay that is introduced before a title change to avoid flickers
         private var titleChangeTimer: Timer?
@@ -426,13 +426,6 @@ extension Ghostty {
             guard self.focused != focused else { return }
             self.focused = focused
 
-            // Drop stale focus-transfer suppression when we lose focus so a
-            // later release can still end selection etc.
-            if !focused {
-                suppressNextLeftMouseDown = false
-                suppressNextLeftMouseUp = false
-            }
-
             // Notify libghostty
             ghostty_surface_set_focus(surface, focused)
 
@@ -658,9 +651,8 @@ extension Ghostty {
             // because there could be some other overlays on top, like search bar
             guard window.contentView?.hitTest(location) == self else { return event }
 
-            // Reset suppression unless this press is a focus-transfer below.
-            suppressNextLeftMouseDown = false
-            suppressNextLeftMouseUp = false
+            // Drop a stale armed sequence from a prior press that never got an up.
+            suppressLeftMouseSequence = false
 
             // If we're already the first responder then no focus transfer is
             // happening, so the click should continue as normal.
@@ -670,13 +662,12 @@ extension Ghostty {
 
             // App/window already focused: this click only transfers split
             // focus. Still return the event so SwiftUI can see it (divider
-            // drag); do not encode it to the PTY (see mouseDown/mouseUp).
-            // Swallowing here (return nil) blocked first-press divider resize
-            // on the unfocused side of a seam after #11167.
+            // drag); do not encode the sequence to the PTY. Swallowing here
+            // (return nil) blocked first-press divider resize on the unfocused
+            // side of a seam after #11167.
             if NSApp.isActive && window.isKeyWindow {
+                suppressLeftMouseSequence = true
                 window.makeFirstResponder(self)
-                suppressNextLeftMouseDown = true
-                suppressNextLeftMouseUp = true
                 return event
             }
 
@@ -881,11 +872,8 @@ extension Ghostty {
         }
 
         override func mouseDown(with event: NSEvent) {
-            // Focus-transfer press: AppKit/SwiftUI may handle it; the PTY must not.
-            if suppressNextLeftMouseDown {
-                suppressNextLeftMouseDown = false
-                return
-            }
+            // Focus-transfer sequence: keep the flag armed until mouseUp.
+            guard !suppressLeftMouseSequence else { return }
 
             guard let surface = self.surface else { return }
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
@@ -893,16 +881,9 @@ extension Ghostty {
         }
 
         override func mouseUp(with event: NSEvent) {
-            // Matching release for a focus-transfer press (no PTY press was sent).
-            if suppressNextLeftMouseUp {
-                suppressNextLeftMouseUp = false
-                // Clear any Force Touch stage from this tracking sequence so
-                // the next real press isn't blocked, and release pressure that
-                // may have been reported before we gated pressureChange.
+            if suppressLeftMouseSequence {
+                suppressLeftMouseSequence = false
                 prevPressureStage = 0
-                if let surface = self.surface {
-                    ghostty_surface_mouse_pressure(surface, 0, 0)
-                }
                 return
             }
 
@@ -1036,11 +1017,8 @@ extension Ghostty {
         }
 
         override func mouseDragged(with event: NSEvent) {
-            // Focus-transfer sequences never pressed into the PTY; skip motion
-            // reports until the matching up is consumed.
-            if suppressNextLeftMouseDown || suppressNextLeftMouseUp {
-                return
-            }
+            // Focus-transfer sequence must not produce press-associated motion.
+            guard !suppressLeftMouseSequence else { return }
             self.mouseMoved(with: event)
         }
 
@@ -1076,11 +1054,7 @@ extension Ghostty {
         }
 
         override func pressureChange(with event: NSEvent) {
-            // Focus-transfer sequences are not PTY presses; ignore Force Touch
-            // so we don't start Quick Look or leave pressure stage stuck.
-            if suppressNextLeftMouseDown || suppressNextLeftMouseUp {
-                return
-            }
+            guard !suppressLeftMouseSequence else { return }
 
             guard let surface = self.surface else { return }
 
