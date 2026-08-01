@@ -191,8 +191,10 @@ extension Ghostty {
         // This is set to non-null during keyDown to accumulate insertText contents
         private var keyTextAccumulator: [String]?
 
-        // True when we've consumed a left mouse-down only to move focus and
-        // should suppress the matching mouse-up from being reported.
+        // Focus-transfer clicks must not be encoded to the PTY, but the
+        // NSEvent still has to reach SwiftUI (e.g. split-divider DragGesture).
+        // The local monitor marks the sequence; mouseDown/mouseUp honor it.
+        private var suppressNextLeftMouseDown: Bool = false
         private var suppressNextLeftMouseUp: Bool = false
 
         // A small delay that is introduced before a title change to avoid flickers
@@ -424,10 +426,10 @@ extension Ghostty {
             guard self.focused != focused else { return }
             self.focused = focused
 
-            // If we lost our focus then remove the mouse event suppression so
-            // our mouse release event leaving the surface can properly be
-            // sent to stop things like mouse selection.
+            // Drop stale focus-transfer suppression when we lose focus so a
+            // later release can still end selection etc.
             if !focused {
+                suppressNextLeftMouseDown = false
                 suppressNextLeftMouseUp = false
             }
 
@@ -656,8 +658,8 @@ extension Ghostty {
             // because there could be some other overlays on top, like search bar
             guard window.contentView?.hitTest(location) == self else { return event }
 
-            // We always assume that we're resetting our mouse suppression
-            // unless we see the specific scenario below to set it.
+            // Reset suppression unless this press is a focus-transfer below.
+            suppressNextLeftMouseDown = false
             suppressNextLeftMouseUp = false
 
             // If we're already the first responder then no focus transfer is
@@ -666,21 +668,22 @@ extension Ghostty {
                 return event
             }
 
-            // If our window/app is already focused, then this click is only
-            // being used to transfer split focus. Consume it so it does not
-            // get forwarded to the terminal as a mouse click.
+            // App/window already focused: this click only transfers split
+            // focus. Still return the event so SwiftUI can see it (divider
+            // drag); do not encode it to the PTY (see mouseDown/mouseUp).
+            // Swallowing here (return nil) blocked first-press divider resize
+            // on the unfocused side of a seam after #11167.
             if NSApp.isActive && window.isKeyWindow {
                 window.makeFirstResponder(self)
+                suppressNextLeftMouseDown = true
                 suppressNextLeftMouseUp = true
-                return nil
+                return event
             }
 
             // Make ourselves the first responder
             window.makeFirstResponder(self)
 
-            // We have to keep processing the event so that AppKit can properly
-            // focus the window and dispatch events. If you return nil here then
-            // nobody gets a windowDidBecomeKey event and so on.
+            // Keep processing so AppKit can focus the window (windowDidBecomeKey).
             return event
         }
 
@@ -878,14 +881,19 @@ extension Ghostty {
         }
 
         override func mouseDown(with event: NSEvent) {
+            // Focus-transfer press: AppKit/SwiftUI may handle it; the PTY must not.
+            if suppressNextLeftMouseDown {
+                suppressNextLeftMouseDown = false
+                return
+            }
+
             guard let surface = self.surface else { return }
             let mods = Ghostty.ghosttyMods(event.modifierFlags)
             ghostty_surface_mouse_button(surface, GHOSTTY_MOUSE_PRESS, GHOSTTY_MOUSE_LEFT, mods)
         }
 
         override func mouseUp(with event: NSEvent) {
-            // If this mouse-up corresponds to a focus-only click transfer,
-            // suppress it so we don't emit a release without a press.
+            // Matching release for a focus-transfer press (no PTY press was sent).
             if suppressNextLeftMouseUp {
                 suppressNextLeftMouseUp = false
                 return
@@ -1021,6 +1029,11 @@ extension Ghostty {
         }
 
         override func mouseDragged(with event: NSEvent) {
+            // Focus-transfer sequences never pressed into the PTY; skip motion
+            // reports until the matching up is consumed.
+            if suppressNextLeftMouseDown || suppressNextLeftMouseUp {
+                return
+            }
             self.mouseMoved(with: event)
         }
 
