@@ -896,6 +896,13 @@ extension Ghostty {
             // Matching release for a focus-transfer press (no PTY press was sent).
             if suppressNextLeftMouseUp {
                 suppressNextLeftMouseUp = false
+                // Clear any Force Touch stage from this tracking sequence so
+                // the next real press isn't blocked, and release pressure that
+                // may have been reported before we gated pressureChange.
+                prevPressureStage = 0
+                if let surface = self.surface {
+                    ghostty_surface_mouse_pressure(surface, 0, 0)
+                }
                 return
             }
 
@@ -1069,6 +1076,12 @@ extension Ghostty {
         }
 
         override func pressureChange(with event: NSEvent) {
+            // Focus-transfer sequences are not PTY presses; ignore Force Touch
+            // so we don't start Quick Look or leave pressure stage stuck.
+            if suppressNextLeftMouseDown || suppressNextLeftMouseUp {
+                return
+            }
+
             guard let surface = self.surface else { return }
 
             // Notify Ghostty first. We do this because this will let Ghostty handle
